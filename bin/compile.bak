@@ -1,0 +1,144 @@
+#!/bin/sh
+
+# Meteor Heroku buildpack for Meteor 0.9.3+.
+
+# fail fast.
+set -e
+# debug verbosely.
+#set -x
+
+#Load config vars into environment (from https://devcenter.heroku.com/articles/buildpack-api)
+export_env_dir() {
+    env_dir=$1
+    whitelist_regex=${2:-''}
+    blacklist_regex=${3:-'^(PATH|GIT_DIR|CPATH|CPPATH|LD_PRELOAD|LIBRARY_PATH)$'}
+    if [ -d "$env_dir" ]; then
+	for e in $(ls $env_dir); do
+	    echo "$e" | grep -E "$whitelist_regex" | grep -qvE "$blacklist_regex" &&
+	    export "$e=$(cat $env_dir/$e)"
+	    :
+	done
+    fi
+}
+
+export_env_dir $3
+
+# Get the path to dir one above this file.
+BUILDPACK_DIR=$(cd -P -- "$(dirname -- "$0")" && cd .. && pwd -P)
+# Get the directory our app is checked out in (the "BUILD_DIR"), passed by Heroku
+APP_CHECKOUT_DIR=$1
+# Where the Meteor app source code is located
+APP_SOURCE_DIR="$APP_CHECKOUT_DIR"
+# The Iron scaffolding tool (https://github.com/iron-meteor/iron-cli) place the
+# Meteor app in /app/ instead of in the root. So let's try the /app/ folder if
+# there is no Meteor app in the root.
+if [ ! -d "$APP_SOURCE_DIR/.meteor" ] && [ -d "$APP_SOURCE_DIR/app/.meteor" ]; then
+  APP_SOURCE_DIR="$APP_SOURCE_DIR/app/"
+fi
+# Where we will install meteor. Has to be outside the APP_CHECKOUT_DIR.
+METEOR_DIR=`mktemp -d "$BUILDPACK_DIR"/meteor-XXXX`
+# Where we'll put things we compile.
+COMPILE_DIR_SUFFIX=".meteor/heroku_build"
+COMPILE_DIR="$APP_CHECKOUT_DIR"/"$COMPILE_DIR_SUFFIX"
+
+# Create directories as needed.
+mkdir -p "$APP_CHECKOUT_DIR" "$METEOR_DIR" "$COMPILE_DIR"
+
+# Update the path so we get npm, etc.
+PATH="$COMPILE_DIR/bin:$PATH"
+
+#
+# Install node
+#
+echo "-----> Installing node"
+NODE_VERSION=`curl -sS --get https://semver.io/node/resolve/0.10.x`
+NODE_URL="http://s3pository.heroku.com/node/v$NODE_VERSION/node-v$NODE_VERSION-linux-x64.tar.gz"
+curl -sS $NODE_URL -o - | tar -zxf - -C $COMPILE_DIR --strip 1
+# Export some environment variables for npm to use when compiling stuff.
+export npm_config_prefix="$COMPILE_DIR"
+export CPATH="$COMPILE_DIR"/include
+export CPPPATH="$CPATH"
+
+#
+# Install meteor
+#
+echo "-----> Installing meteor"
+
+
+echo
+echo "!!! Workaround for invalid url/version in Meteor install script"
+echo "!!! More details: https://github.com/meteor/meteor/issues/5445"
+echo
+curl https://raw.githubusercontent.com/tjmonsi/stable-meteor-install/master/meteorInstall.sh | HOME="$METEOR_DIR" /bin/sh
+# curl -sS https://install.meteor.com | HOME="$METEOR_DIR" /bin/sh
+
+
+METEOR="$METEOR_DIR/.meteor/meteor" # The meteor binary.
+
+#
+# Build the meteor app!
+#
+echo "-----> Bundling bundle"
+cd $APP_SOURCE_DIR
+
+# Now on to bundling. Don't put the bundle in $APP_CHECKOUT_DIR, or it will
+# recurse, trying to bundle up its own bundling.
+BUNDLE_DEST=`mktemp -d "$BUILDPACK_DIR/build-XXXX"`
+
+#
+# Fix to remove mobile platform according to
+# https://github.com/AdmitHub/meteor-buildpack-horse/pull/57/files
+#
+echo "!!! Workaround of failed build when mobile platforms are added"
+echo "!!! Removing android platform for the build (this will broke hot-code-push))"
+echo "!!! More details: https://github.com/AdmitHub/meteor-buildpack-horse/pull/57/files"
+HOME=$METEOR_DIR $METEOR remove-platform android || true
+
+# <hack issue="https://github.com/meteor/meteor/issues/2796>
+# the root cause seems to be related to https://github.com/meteor/meteor/issues/2606
+# Also remember to use 'heroku stack:set cedar-14' to allow certain recompiled
+# packages to use the newer version memcpy that ships with a more recent version
+# of glibc (contained in cedar-14)
+if [ -n "${BUILDPACK_PRELAUNCH_METEOR+1}" ]; then
+echo "-----> Pre-launching Meteor to create packages assets and prevent bundling from failing"
+    #
+    # Fix to remove mobile platform according to
+    # https://github.com/AdmitHub/meteor-buildpack-horse/pull/57/files
+    #
+    # HOME=$METEOR_DIR $METEOR remove-platform ios android
+    HOME=$METEOR_DIR timeout -s9 60 $METEOR --settings settings.json || true
+fi
+# </hack>
+
+echo "-----> Building Meteor with ROOT_URL: $ROOT_URL"
+HOME=$METEOR_DIR $METEOR build --server $ROOT_URL --directory $BUNDLE_DEST
+mv $BUNDLE_DEST/bundle "$COMPILE_DIR/app"
+rmdir $BUNDLE_DEST
+
+# If we use npm, run npm install.
+if [ -e "$COMPILE_DIR"/app/programs/server/package.json ]; then
+  cd "$COMPILE_DIR"/app/programs/server && npm install
+fi
+
+#
+# Environment
+#
+# Add an export of PATH which includes our compile dir.
+echo "-----> Adding PATH environment"
+mkdir -p "$APP_CHECKOUT_DIR"/.profile.d
+cat > "$APP_CHECKOUT_DIR"/.profile.d/path.sh <<EOF
+  #!/bin/sh
+  export PATH=\$HOME/$COMPILE_DIR_SUFFIX/bin:\$PATH
+  export LD_LIBRARY_PATH=\$LD_LIBRARY_PATH:\$HOME/$COMPILE_DIR_SUFFIX/lib
+EOF
+
+#
+# Extras
+#
+
+# source scripts in 'extra' dir, if any.  Create them for custom stuff like
+# binary dependencies, phantomjs for spiderable, etc.
+echo "-----> Running extras"
+for file in `ls "$BUILDPACK_DIR"/extra | sort`; do
+    . "$BUILDPACK_DIR"/extra/$file
+done
